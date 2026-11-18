@@ -49,11 +49,15 @@ format and round-trips bit-exact.
 
 ## Requirements
 
-- Windows 10 or 11. The code is not tested on macOS or Linux.
+- Windows 10 or 11, or macOS on Apple Silicon. Linux is not tested.
 - [Node.js](https://nodejs.org) 22 or newer.
 - Python 3.10 to 3.13.
 - For Deep Fill: an NVIDIA GPU, a CUDA toolkit and the MSVC build tools
   (gsplat compiles on first use). About 3 GB of downloads.
+
+On macOS the editor, Fast Fill, the Clone Stamp and the selection tools work.
+Deep Fill and the hidden-debris part of Clean up need an NVIDIA GPU, so they
+are not available there; Clean up still finds splats cut off from the rest.
 
 ## Install
 
@@ -98,10 +102,27 @@ GitHub, unpack it and run `install.cmd` in the unpacked folder.
 powershell -ExecutionPolicy Bypass -File app\create-shortcut.ps1
 ```
 
+### macOS
+
+The same steps with the shell scripts: clone the repository, then run the
+installer in the `splat-repair` folder:
+
+```bash
+./install.sh
+```
+
+Start the app with `app/start.sh`.
+
 ## Update
 
 ```bash
 update.cmd
+```
+
+On macOS:
+
+```bash
+./update.sh
 ```
 
 This pulls the newest version and rebuilds the app. Add `deep` if you use
@@ -141,6 +162,12 @@ Run the engine tests (each file is a plain script):
 ```bash
 cd core
 for %t in (tests\test_*.py) do .venv\Scripts\python %t
+```
+
+On macOS:
+
+```bash
+cd core && for t in tests/test_*.py; do .venv/bin/python "$t" || echo "FAILED: $t"; done
 ```
 
 ## How it is built

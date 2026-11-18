@@ -25,6 +25,12 @@ cd core
 for %t in (tests\test_*.py) do .venv\Scripts\python %t
 ```
 
+On macOS:
+
+```bash
+cd core && for t in tests/test_*.py; do .venv/bin/python "$t" || echo "FAILED: $t"; done
+```
+
 ```bash
 cd app
 npx tsc --noEmit -p .
