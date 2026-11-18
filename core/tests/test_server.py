@@ -361,17 +361,23 @@ def main():
             # never started, by a test.
             assert "photoshop" in hc, hc
             c.call("open", path=ply)
-            hv, pv = c.call("deep_repair", idx_payload(sel), fill="lama",
-                            params={"mode": "rim", "seed": 3},
-                            deep={"steps": 20})
-            assert hv["ok"], hv
-            assert hv["info"].get("fill_source") == "LaMa", hv["info"]
-            assert hv["addedCount"] > 0, hv
+            # The wide view needs the GPU renderer as well as LaMa; "deep"
+            # alone is also true with OpenCV on a machine without CUDA.
+            if hc["viewFill"]:
+                hv, pv = c.call("deep_repair", idx_payload(sel), fill="lama",
+                                params={"mode": "rim", "seed": 3},
+                                deep={"steps": 20})
+                assert hv["ok"], hv
+                assert hv["info"].get("fill_source") == "LaMa", hv["info"]
+                assert hv["addedCount"] > 0, hv
+                print("  deep view   %s, deep=%s, Photoshop=%s"
+                      % (hv["info"]["fill_source"], hv["info"]["deep"],
+                         hc["photoshop"]))
+            else:
+                print("  deep view   skipped: %s" % hc["viewFillDetail"])
             hb, _ = c.call("deep_repair", idx_payload(sel), fill="gimp",
                            params={"mode": "rim", "seed": 3})
             assert not hb["ok"] and "fill" in hb["error"], hb
-            print("  deep view   %s, deep=%s, Photoshop=%s"
-                  % (hv["info"]["fill_source"], hv["info"]["deep"], hc["photoshop"]))
         else:
             print("  deep        skipped: %s" % (hc["inpainterDetail"]
                                                       or hc["gpuDetail"]))
