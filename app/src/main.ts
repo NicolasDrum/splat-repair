@@ -122,11 +122,8 @@ let lastFill: { idx: ArrayBuffer; deep: boolean; seed: number; serial: number;
                 /** Whether the fill asked for the object grow (objectGrow). */
                 objects: boolean } | null = null;
 let editSerial = 0;
-/**
- * The edit the last export wrote (null: the file as it was opened), to tell
- * whether closing the window or opening another file would lose work.
- */
-let exportedStep: HistoryEntry | null = null;
+/** Geometry revision captured by the last successful export for this file. */
+let exportedRevision = 0;
 /** The engine's last report, for the test harness to read. */
 let lastInfo: any = null;
 /** What the engine said about the last fill (views taken, seconds each): for the autotest's log. */
@@ -304,21 +301,13 @@ history.addPart<SelectionSnapshot>('selection', {
 // undoing that step switches it on again
 history.onChange(() => refreshReroll());
 
-/** The last edit that is applied now: the newest edit step at or below the current one. */
-function lastAppliedEdit(): HistoryEntry | null {
-  const list = history.entries;
-  for (let i = history.index; i > 0; i--) if (list[i].kind === 'edit') return list[i];
-  return null;
-}
-
 /**
- * Would closing this document lose work? Edits are applied, and the last of
- * them is not the one an export wrote. (With no edit applied the document is
- * the file on disk again.)
+ * The original file is already on disk. An edited revision is safe to
+ * discard once an export of that revision succeeds.
  */
 function hasUnexportedEdits(): boolean {
-  const e = lastAppliedEdit();
-  return !!e && e !== exportedStep;
+  const revision = history.revision;
+  return revision !== 0 && revision !== exportedRevision;
 }
 window.host.onUnexportedQuery(hasUnexportedEdits);
 /** Menus, view cube, options bar; created at boot (ui/shell.ts). */
@@ -443,7 +432,7 @@ function closeDocument() {
   lastGeneratedCount = 0;
   lastFill = null;
   lastFillVolume = null;
-  exportedStep = null;
+  exportedRevision = 0;
   gpuSel?.destroy();
   gpuSel = null;
   cloneSource = cloneOrigin = cloneAlignedOffset = null;
@@ -524,7 +513,7 @@ async function openFile(path: string) {
     const info = await viewer.load(window.host.splatUrl(viewPath), viewName);
     doc.load(viewer.gsplatData);
     filePath = path;
-    exportedStep = null;
+    exportedRevision = 0;
     lastFill = null;
     lastFillVolume = null;
     // Forget the previous file's selection, crop and stamp source first.
@@ -1656,7 +1645,7 @@ async function doExport() {
   if (engineBusy) { status('not exported: something is still running, try again when it is done'); return; }
   const shCap = $<HTMLSelectElement>('export-sh').value;
   // what this export writes: the document as the history has it now
-  const written = lastAppliedEdit();
+  const written = history.revision;
   setBusy(true, 'Exporting …');
   try {
     const r = await engine('save', {
@@ -1664,7 +1653,7 @@ async function doExport() {
       options: shCap === '' ? {} : { sh_degree: Number(shCap) }
     });
     const h = r.header;
-    exportedStep = written;
+    exportedRevision = written;
     // Say what the format had to give up. "Exported" on its own reads the
     // same whether or not half the radiance field went with it.
     const cost: string[] = [];

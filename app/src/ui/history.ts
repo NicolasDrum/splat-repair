@@ -40,6 +40,8 @@ export interface HistoryEntry {
   before: Snap;
   after: Snap;
   time: number;
+  /** Geometry revision after this step. Selection steps inherit it. */
+  revision: number;
   /** A run of changes that folds into this step (`mergeNext`), and when it last did. */
   merge?: { key: string; at: number };
 }
@@ -85,6 +87,7 @@ export class History {
   private list: HistoryEntry[] = [];
   /** Index of the entry whose `after` is the current state. */
   private pos = -1;
+  private nextRevision = 1;
   /** The selection as last committed to the list. */
   private current: Snap = {};
   private muted = 0;
@@ -134,7 +137,7 @@ export class History {
     this.openEdit = null;
     this.current = this.snapshot();
     this.list = [{ kind: 'base', label, before: this.current, after: this.current,
-                   time: Date.now() }];
+                   time: Date.now(), revision: 0 }];
     this.pos = 0;
     this.changed();
   }
@@ -241,6 +244,7 @@ export class History {
       return;
     }
     this.push({ kind: 'selection', label, before: this.current, after: now, time: Date.now(),
+                revision: this.revision,
                 ...(merge ? { merge: { key: merge.key, at: t } } : {}) });
   }
 
@@ -260,7 +264,8 @@ export class History {
     this.pendingLabel = null;
     const after = this.snapshot();
     const e: HistoryEntry = { kind: 'edit', label: label ?? this.busyLabel ?? 'Edit',
-                              before: this.current, after, time: Date.now() };
+                              before: this.current, after, time: Date.now(),
+                              revision: this.nextRevision++ };
     this.push(e);
     this.openEdit = this.host.busy() ? e : null;
   }
@@ -286,9 +291,9 @@ export class History {
     while (this.list.length > 2 && (this.list.length > MAX_ENTRIES || bytes > MAX_BYTES)) {
       const gone = this.list.splice(1, 1)[0];
       bytes -= this.bytesOf(gone.before) + this.bytesOf(gone.after);
-      // the base takes on the state the dropped step left
+      // The base takes on both the selection and geometry left by the dropped step.
       this.list[0] = { ...this.list[0], before: gone.after, after: gone.after,
-                       label: this.list[0].label };
+                       revision: gone.revision };
       this.pos--;
     }
   }
@@ -299,6 +304,8 @@ export class History {
   get canRedo() { return this.pos < this.list.length - 1; }
   get entries(): readonly HistoryEntry[] { return this.list; }
   get index() { return this.pos; }
+  /** Zero denotes the original file (or an empty history). */
+  get revision() { return this.list[this.pos]?.revision ?? 0; }
   get undoLabel() { return this.canUndo ? this.list[this.pos].label : null; }
   get redoLabel() { return this.canRedo ? this.list[this.pos + 1].label : null; }
 
