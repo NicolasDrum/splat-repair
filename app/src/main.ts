@@ -21,6 +21,7 @@ import { GpuSelector } from './engine/gpuselect';
 import { SelectionGizmo, toEngineQuat, type GizmoMode, type GizmoDelta }
   from './engine/gizmo';
 import { History, type HistoryEntry } from './ui/history';
+import { formatSideError } from './ui/fill-status';
 import { Shell } from './ui/shell';
 import { ClonePreview } from './ui/clonepreview';
 import { robustBounds } from './engine/navpick';
@@ -1236,9 +1237,7 @@ async function doRepair(reroll?: { idx: ArrayBuffer; deep: boolean; seed: number
         ? `${how} + ${h.info.fill_source ?? h.info.inpainter}`
           + (h.info.fill_fallback ? ` (Generative Fill: ${h.info.fill_fallback})` : '')
           + ` · ${num(100 * (h.info.fit ?? 0), 1)}% off the fill picture`
-          + (h.info.offAxisDeep != null
-            ? ` · from the side ${num(100 * h.info.offAxisGeo / 3, 1)} → ${num(100 * h.info.offAxisDeep / 3, 1)}%`
-            : '')
+          + formatSideError(h.info)
         : `${how} · Deep Fill discarded`
           + (h.info?.fill_source ? ` (${h.info.fill_source})` : '')
           + `: ${h.info?.rejected ?? 'unclear'}`;
