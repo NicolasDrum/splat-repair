@@ -15,6 +15,7 @@ few thousand integers crossing the pipe instead of megabytes of geometry.
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,7 +23,7 @@ from typing import Optional
 import numpy as np
 
 from .io import SplatSet, load_ply, save_ply
-from .formats import load_any, save_any, sniff
+from .formats import load_any, load_spz_with_antialiasing, save_any, sniff
 from .repair import NothingToFill, RepairParams, RepairResult, repair
 
 
@@ -141,6 +142,7 @@ class Document:
         self.alive = np.ones(splats.n, bool)
         self.path = path
         self.source_format = "ply"   # what it was opened from, for the export default
+        self.spz_antialiased = False
         self.undo_stack: list[Edit] = []
         self.redo_stack: list[Edit] = []
         self._floaters = None        # measured lazily, re-used across thresholds
@@ -156,8 +158,13 @@ class Document:
         of failing somewhere inside the parser.
         """
         kind = sniff(path)
-        doc = cls(load_any(path), str(path))
+        if kind == "spz":
+            splats, antialiased = load_spz_with_antialiasing(path)
+        else:
+            splats, antialiased = load_any(path), False
+        doc = cls(splats, str(path))
         doc.source_format = kind
+        doc.spz_antialiased = antialiased
         return doc
 
     @property
@@ -1186,6 +1193,10 @@ class Document:
         give up -- the caller is expected to pass that on, because "saved"
         reads very differently when half the radiance field went with it.
         """
+        if fmt is None:
+            fmt = os.path.splitext(str(path))[1].lower().lstrip(".")
+        if fmt == "spz":
+            opts.setdefault("antialiased", self.spz_antialiased)
         s = self.live_splats()
         info = save_any(path, s, fmt, **opts) or {}
         return {"written": s.n, "shDegree": s.sh_degree, **info}

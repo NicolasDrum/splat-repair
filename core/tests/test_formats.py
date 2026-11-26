@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from splatcore.io import SplatSet, replacing, save_ply           # noqa: E402
 from splatcore import formats                                     # noqa: E402
+from splatcore.document import Document                           # noqa: E402
 from splatcore.formats import (                                   # noqa: E402
     NGSP_MAGIC, load_any, load_splat, load_spz, save_splat, save_spz, sniff,
 )
@@ -252,6 +253,30 @@ def test_spz_roundtrip_v3_is_the_default_and_says_why():
         "by an order of magnitude" % (e3.max(), e2.max())
 
 
+def test_document_preserves_spz_antialiasing():
+    s = _synthetic(n=16)
+    with tempfile.TemporaryDirectory() as d:
+        source = os.path.join(d, "scan.ply")  # sniff the SPZ content, not its name
+        output = os.path.join(d, "export.spz")
+        for version in (2, 3):
+            for enabled in (False, True):
+                save_spz(source, s, version=version, antialiased=enabled)
+                doc = Document.open(source)
+                doc.delete([0])
+                doc.save(output)
+                with gzip.open(output, "rb") as g:
+                    assert g.read(16)[14] == int(enabled)
+                assert load_spz(output).n == s.n - 1
+                doc.undo()
+                doc.save(output, antialiased=not enabled)
+                with gzip.open(output, "rb") as g:
+                    assert g.read(16)[14] == int(not enabled)
+                assert load_spz(output).n == s.n
+        Document(s).save(output)
+        with gzip.open(output, "rb") as g:
+            assert g.read(16)[14] == 0
+
+
 def test_spz_degree_cap():
     s = _synthetic(deg=3)
     with tempfile.TemporaryDirectory() as d:
@@ -365,12 +390,16 @@ def test_spz_version4_reader():
         toc = b"".join(struct.pack("<QQ", len(c), len(p))
                        for c, p in zip(packed, streams))
         header = struct.pack("<IIIBBBBI12x", NGSP_MAGIC, 4, n,
-                             s.sh_degree, 12, 0, len(packed), 32)
+                             s.sh_degree, 12, 1, len(packed), 32)
 
         p4 = os.path.join(d, "v4.spz")
         with open(p4, "wb") as f:
             f.write(header + toc + b"".join(packed))
         b = load_spz(p4)
+        reexport = os.path.join(d, "reexport.spz")
+        Document.open(p4).save(reexport)
+        with gzip.open(reexport, "rb") as g:
+            assert g.read(16)[14] == 1
 
     assert b.n == s.n and b.sh_degree == s.sh_degree
     _spz_bounds(b, s, 3)

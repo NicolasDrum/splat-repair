@@ -63,6 +63,7 @@ NGSP_MAGIC = 0x5053474E          # "NGSP", little-endian
 SPZ_LATEST = 4
 SPZ_SMALLEST_THREE_FROM = 3      # version that switched quaternion encoding
 SPZ_ZSTD_FROM = 4                # version that switched container
+SPZ_FLAG_ANTIALIASED = 0x1
 COLOR_SCALE = 0.15               # spz's fixed colour quantisation scale
 _SQRT_HALF = float(np.sqrt(0.5))
 
@@ -398,6 +399,12 @@ def _spz_check_count(n):
 
 def load_spz(path) -> SplatSet:
     """Load a Niantic ``.spz``, any version from 1 to 4."""
+    splats, _ = load_spz_with_antialiasing(path)
+    return splats
+
+
+def load_spz_with_antialiasing(path) -> tuple[SplatSet, bool]:
+    """Load the splats and the source file's antialiasing flag."""
     with open(path, "rb") as f:
         head = f.read(2)
     if head == b"\x1f\x8b":
@@ -418,7 +425,7 @@ def load_spz(path) -> SplatSet:
         return _load_spz_ngsp(f.read())
 
 
-def _load_spz_legacy(blob: bytes) -> SplatSet:
+def _load_spz_legacy(blob: bytes) -> tuple[SplatSet, bool]:
     """Versions 1-3: a 16-byte header and six arrays, the lot gzipped."""
     if len(blob) < 16:
         raise ValueError("spz truncated: no header")
@@ -441,10 +448,10 @@ def _load_spz_legacy(blob: bytes) -> SplatSet:
                              % (name, size, len(blob) - off))
         parts[name] = blob[off:off + size]
         off += size
-    return _spz_decode(parts, n, version, sh_degree, fractional_bits)
+    return _spz_decode(parts, n, version, sh_degree, fractional_bits), bool(flags & SPZ_FLAG_ANTIALIASED)
 
 
-def _load_spz_ngsp(blob: bytes) -> SplatSet:
+def _load_spz_ngsp(blob: bytes) -> tuple[SplatSet, bool]:
     """Version 4: a 32-byte header, a table of contents, zstd streams."""
     if len(blob) < 32:
         raise ValueError("spz truncated: no header")
@@ -497,7 +504,7 @@ def _load_spz_ngsp(blob: bytes) -> SplatSet:
                              % (name, len(data), plain))
         parts[name] = data
         off += comp
-    return _spz_decode(parts, n, version, sh_degree, fractional_bits)
+    return _spz_decode(parts, n, version, sh_degree, fractional_bits), bool(flags & SPZ_FLAG_ANTIALIASED)
 
 
 def save_spz(path, s: SplatSet, version: int = 3, sh_degree: int | None = None,
@@ -564,7 +571,7 @@ def save_spz(path, s: SplatSet, version: int = 3, sh_degree: int | None = None,
     else:
         sh = np.zeros((n, 0), np.uint8)
 
-    flags = 0x1 if antialiased else 0x0
+    flags = SPZ_FLAG_ANTIALIASED if antialiased else 0
     header = struct.pack("<IIIBBBB", NGSP_MAGIC, version, n,
                          deg, fractional_bits, flags, 0)
 
