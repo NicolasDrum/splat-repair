@@ -6,16 +6,18 @@ A bound that is loose enough to pass whatever the code does would prove
 nothing, so each one is derived from the format's own step size: half a
 quantisation step, and no more.
 """
+import errno
 import gzip
 import os
 import struct
 import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from splatcore.io import SplatSet, save_ply                      # noqa: E402
+from splatcore.io import SplatSet, replacing, save_ply           # noqa: E402
 from splatcore import formats                                     # noqa: E402
 from splatcore.formats import (                                   # noqa: E402
     NGSP_MAGIC, load_any, load_splat, load_spz, save_splat, save_spz, sniff,
@@ -59,6 +61,70 @@ def _angle_deg(a, b):
     b = b / np.maximum(np.linalg.norm(b, axis=1, keepdims=True), 1e-12)
     d = np.abs((a * b).sum(1))
     return np.degrees(2.0 * np.arccos(np.clip(d, -1.0, 1.0)))
+
+
+def test_exports_preserve_existing_tmp_neighbors():
+    s = _synthetic(n=16)
+    with tempfile.TemporaryDirectory() as d:
+        folder = Path(d)
+        expected = set()
+        for extension in ("ply", "splat", "spz"):
+            path = folder / f"scene.{extension}"
+            neighbor = folder / f"{path.name}.tmp"
+            neighbor.write_bytes(b"unrelated file")
+
+            formats.save_any(path, s)
+            assert neighbor.exists(), f"exporting {extension} removed a neighboring file"
+            assert neighbor.read_bytes() == b"unrelated file"
+            assert load_any(path).n == s.n
+
+            first_export = path.read_bytes()
+            formats.save_any(path, s)
+            assert path.read_bytes() == first_export
+            assert neighbor.read_bytes() == b"unrelated file"
+            expected.update((path, neighbor))
+        assert set(folder.iterdir()) == expected
+
+
+def test_failed_write_preserves_destination_and_neighbor():
+    with tempfile.TemporaryDirectory() as d:
+        folder = Path(d)
+        path = folder / "scene.ply"
+        neighbor = folder / "scene.ply.tmp"
+        path.write_bytes(b"previous export")
+        neighbor.write_bytes(b"unrelated file")
+        try:
+            with replacing(path) as tmp:
+                Path(tmp).write_bytes(b"partial export")
+                raise OSError(errno.ENOSPC, "simulated write failure", tmp)
+        except OSError as error:
+            assert error.errno == errno.ENOSPC
+            assert error.filename == str(path)
+        else:
+            raise AssertionError("the writer error must reach the caller")
+        assert path.read_bytes() == b"previous export"
+        assert neighbor.exists(), "failure cleanup removed a neighboring file"
+        assert neighbor.read_bytes() == b"unrelated file"
+        assert set(folder.iterdir()) == {path, neighbor}
+
+
+def test_overlapping_writes_keep_independent_temporary_files():
+    with tempfile.TemporaryDirectory() as d:
+        folder = Path(d)
+        path = folder / "scene.ply"
+        path.write_bytes(b"previous export")
+        # Complete the second write while the first is still staged.
+        with replacing(path) as first:
+            Path(first).write_bytes(b"complete first export")
+            with replacing(path) as second:
+                assert Path(first).parent == Path(second).parent == folder
+                assert first != second
+                Path(second).write_bytes(b"complete second export")
+                assert path.read_bytes() == b"previous export"
+            assert path.read_bytes() == b"complete second export"
+            assert Path(first).read_bytes() == b"complete first export"
+        assert path.read_bytes() == b"complete first export"
+        assert set(folder.iterdir()) == {path}
 
 
 # ------------------------------------------------------------------- .splat --

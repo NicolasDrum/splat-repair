@@ -22,6 +22,7 @@ import os
 
 import numpy as np
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 SH_C0 = 0.28209479177387814
 
@@ -30,21 +31,25 @@ SH_C0 = 0.28209479177387814
 def replacing(path):
     """Write a file next to ``path`` and swap it in once it is whole.
 
-    Yields the name to write to (``path`` + ".tmp", same folder, so the swap
-    is a rename on one volume). An export that fails halfway -- disk full,
-    an error in the writer -- used to leave a truncated file where the last
-    good one was; now the old file stays and the half-written one is removed.
+    Each writer gets its own file in the destination directory, so writers can
+    overlap and the final rename stays on the same volume.
     """
     path = os.fspath(path)
-    tmp = path + ".tmp"
+    tmp = os.path.join(os.path.dirname(path), f".splat-repair-{uuid4().hex}.tmp")
+    created = False
     try:
+        # Use the permissions of a regular export, subject to the umask.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        created = True
+        os.close(fd)      # The writers reopen the file, including on Windows.
         yield tmp
         os.replace(tmp, path)
     except BaseException as e:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        if created:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         if isinstance(e, OSError) and e.filename == tmp:
             e.filename = path          # the message names the file that was asked for
         raise
