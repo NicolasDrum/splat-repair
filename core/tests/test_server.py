@@ -6,6 +6,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+from io import BytesIO, StringIO
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -178,11 +181,116 @@ def inprocess_checks(src):
     print("  internal    %r, details in the log" % reply["error"])
 
 
+def failed_edit_reply(session, cmd, payload=b"", **params):
+    """Exercise the command and the next request through the framed dispatcher."""
+    import server
+
+    stdin, stdout = BytesIO(), BytesIO()
+    server.write_frame(stdin, {"cmd": cmd, "id": 1, **params}, payload)
+    server.write_frame(stdin, {"cmd": "stats", "id": 2})
+    stdin.seek(0)
+    write_frame = server.write_frame
+
+    def fail_success_frame(stream, header, data=b""):
+        if header.get("id") == 1 and header.get("ok"):
+            raise MemoryError("could not write reply")
+        return write_frame(stream, header, data)
+
+    with (
+        patch.object(server, "Session", return_value=session),
+        patch.object(server, "write_frame", side_effect=fail_success_frame),
+        patch.multiple(sys, stdin=SimpleNamespace(buffer=stdin),
+                       stdout=SimpleNamespace(buffer=stdout), stderr=StringIO()),
+    ):
+        server.main()
+    stdout.seek(0)
+    assert server.read_frame(stdout)[0]["event"] == "ready"
+    failed, _ = server.read_frame(stdout)
+    assert not failed["ok"] and failed["detail"] == "MemoryError", failed
+    stats, _ = server.read_frame(stdout)
+    assert stats["ok"], stats
+    return stats
+
+
+def check_transform_reply_failure(src):
+    """Rolling back a failed reply must work even when undo cannot allocate."""
+    import server
+    from splatcore.document import Document
+
+    session = server.Session()
+    doc = session.doc = Document(src)
+    doc.transform([4], (1, 0, 0, 0), (1, 0, 0), 1)
+    doc.transform([6], (1, 0, 0, 0), (0, 1, 0), 1)
+    doc.undo()
+    before = doc.live_splats()
+    before_mask = doc.alive.copy()
+    kept = doc.redo_stack[-1]
+    with (
+        patch.object(server, "_pack_added", side_effect=MemoryError("could not pack reply")),
+        patch.object(doc, "undo", side_effect=MemoryError("could not allocate undo")),
+    ):
+        stats = failed_edit_reply(session, "transform", idx_payload([2, 3]))
+    assert stats["canUndo"] and stats["canRedo"], stats
+    assert len(doc.undo_stack) == 1 and doc.redo_stack[-1] is kept
+    np.testing.assert_array_equal(doc.alive, before_mask)
+    np.testing.assert_array_equal(doc.live_splats().xyz, before.xyz)
+    assert doc.redo() is kept and doc.undo() is kept
+    print("  rollback    failed transform reply preserved geometry and redo")
+
+
+def check_history_reply_failure(src):
+    import server
+    from splatcore.document import Document
+
+    session = server.Session()
+    doc = session.doc = Document(src)
+    edit = doc.transform([4], (1, 0, 0, 0), (1, 0, 0), 1)
+    for command in ("undo", "redo"):
+        before = doc.alive, doc.generated, edit.tail
+        undo_depth, redo_depth = len(doc.undo_stack), len(doc.redo_stack)
+        stats = failed_edit_reply(session, command)
+        assert stats["canUndo"] == bool(undo_depth) and stats["canRedo"] == bool(redo_depth)
+        assert doc.alive is before[0] and doc.generated is before[1] and edit.tail is before[2]
+        assert len(doc.undo_stack) == undo_depth and len(doc.redo_stack) == redo_depth
+        assert getattr(doc, command)() is edit
+    print("  rollback    failed undo and redo replies preserved both history stacks")
+
+
+def check_refine_reply_failure(src):
+    import server
+    from dataclasses import replace
+    from splatcore import viewfill
+    from splatcore.document import Document
+    from splatcore.repair import RepairParams
+
+    session = server.Session()
+    doc = session.doc = Document(src)
+    doc.fill_engine = "copy"
+    doc.backing_layer = False
+    indices = np.flatnonzero((src.xyz[:, :2] ** 2).sum(1) < 1.4 ** 2)
+    edit = doc.repair(indices, RepairParams(mode="rim"), objects=False)
+    state, generated, info = doc._refine, doc.generated, edit.info
+    quick = state["res"]
+    recolored = quick.added.copy()
+    recolored.f_dc += 0.125
+    result = replace(quick, added=recolored, info={"deep": True})
+    with patch.object(viewfill, "view_fill", return_value=result):
+        failed_edit_reply(session, "refine", judge=False)
+        assert doc._refine is state and doc.generated is generated and edit.info is info
+        assert doc.refine_last(judge=False) is edit
+    assert edit.info["refined"]
+    np.testing.assert_array_equal(doc.generated.f_dc, recolored.f_dc)
+    print("  rollback    failed refine reply preserved geometry and allowed retry")
+
+
 def main():
     tmp = tempfile.mkdtemp()
     ply = os.path.join(tmp, "plane.ply")
     src = make_ply(ply)
     inprocess_checks(src)
+    check_transform_reply_failure(src)
+    check_history_reply_failure(src)
+    check_refine_reply_failure(src)
     c = Client()
     try:
         h, _ = c.call("ping")

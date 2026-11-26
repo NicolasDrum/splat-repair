@@ -1,12 +1,14 @@
 """Transforms must move all four things a Gaussian is made of."""
 import os
 import sys
+from unittest.mock import patch
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from splatcore.io import SplatSet                         # noqa: E402
 from splatcore import transform, shtools                  # noqa: E402
+from splatcore.document import Document                   # noqa: E402
 
 
 def make(n=400, seed=0):
@@ -94,6 +96,35 @@ def test_round_trip_returns_to_start():
         "max drift %.4f" % np.abs(s.xyz - before.xyz).max()
     assert np.allclose(s.sigma, before.sigma, rtol=1e-3)
     print("    forward then inverse returns to the start")
+
+
+def test_failed_transform_keeps_geometry_and_redo():
+    doc = Document(make(32))
+    rotation = (1, 0, 0, 0)
+    doc.transform([4, 5], rotation, (1, 0, 0), 1)
+    doc.transform([6], rotation, (0, 1, 0), 1)
+    doc.undo()
+    before = doc.live_splats()
+    alive, generated = doc.alive, doc.generated
+    expected_undo, expected_redo = doc.undo_stack[-1], doc.redo_stack[-1]
+    concat = np.concatenate
+
+    def fail_mask_allocation(parts, *args, **kwargs):
+        if parts[0] is alive:
+            raise MemoryError("simulated mask allocation failure")
+        return concat(parts, *args, **kwargs)
+
+    with patch.object(np, "concatenate", side_effect=fail_mask_allocation):
+        with np.testing.assert_raises(MemoryError):
+            doc.transform([0, 1], rotation, (0, 0, 1), 1)
+
+    assert doc.alive is alive and doc.generated is generated
+    assert len(doc.undo_stack) == len(doc.redo_stack) == 1
+    assert doc.undo_stack[-1] is expected_undo and doc.redo_stack[-1] is expected_redo
+    np.testing.assert_array_equal(doc.live_splats().xyz, before.xyz)
+    assert doc.redo() is expected_redo
+    assert doc.undo() is expected_redo
+    np.testing.assert_array_equal(doc.live_splats().xyz, before.xyz)
 
 
 def test_rejects_nonsense():

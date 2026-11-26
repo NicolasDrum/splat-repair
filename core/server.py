@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import traceback
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -42,6 +43,10 @@ from splatcore.repair import RepairParams, RepairError  # noqa: E402
 
 PROTOCOL = 1
 MIRROR_PREFIX = "splatcore-view-"     # the viewport's PLY copies, in the temp directory
+EDIT_COMMANDS = frozenset({
+    "delete", "drop_nonfinite", "repair", "deep_repair", "unshadow", "solidify", "transform", "clone",
+    "undo", "redo", "refine",
+})
 
 
 def _read_exactly(stream, n):
@@ -758,30 +763,6 @@ def _own_refusal(e):
         return None
 
 
-def _restore(session, doc, depth, redo):
-    """Put the session back where it was before a command whose reply never left.
-
-    An edit is in the document before its reply is built. If the reply then
-    fails -- packing the new splats, writing the frame -- the app is told of
-    an error and knows nothing of the edit, while the document has one undo
-    step more than the app's history: every later undo is off by one. So the
-    step is taken back and the redo stack is what it was (an undo or redo
-    that lost its reply is replayed the other way; an open, the old document
-    again). A refine changes its edit in place and cannot be taken back here.
-    """
-    try:
-        session.doc = doc
-        if doc is None:
-            return
-        while len(doc.undo_stack) > depth and doc.undo() is not None:
-            pass
-        while len(doc.undo_stack) < depth and doc.redo() is not None:
-            pass
-        doc.redo_stack[:] = redo
-    except Exception:                                # noqa: BLE001
-        traceback.print_exc(file=sys.stderr)
-
-
 def _release_gpu():
     """Hand the GPU memory torch keeps cached back between commands.
 
@@ -837,8 +818,7 @@ def main():
                                  "error": "unknown command %r" % cmd})
             continue
         doc = session.doc
-        depth = len(doc.undo_stack) if doc is not None else 0
-        redo = list(doc.redo_stack) if doc is not None else []
+        editing = doc is not None and cmd in EDIT_COMMANDS
 
         def fail(e, error, kind, where=None, **more):
             """Log it, take back what the command left in the document, tell the app.
@@ -851,14 +831,15 @@ def main():
                 print("[%s] %s%s: %s" % (cmd, "internal error: " if kind == "internal" else "",
                                          type(e).__name__, e), file=sys.stderr)
                 traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
-            _restore(session, doc, depth, redo)
+            session.doc = doc          # an open whose reply failed keeps the old document
             write_frame(stdout, {"id": rid, "ok": False, "error": error, "kind": kind, **more})
 
         try:
-            result, out = fn(hdr, payload)
-            result = dict(result)
-            result.update({"id": rid, "ok": True})
-            write_frame(stdout, result, out)
+            with doc.edit_transaction(cmd) if editing else nullcontext():
+                result, out = fn(hdr, payload)
+                result = dict(result)
+                result.update({"id": rid, "ok": True})
+                write_frame(stdout, result, out)
         except RepairError as e:
             # The engine's own refusals, written for the user: verbatim.
             fail(e, str(e), type(e).__name__)

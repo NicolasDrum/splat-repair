@@ -15,6 +15,7 @@ few thousand integers crossing the pipe instead of megabytes of geometry.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -174,9 +175,6 @@ class Document:
     def live_splats(self) -> SplatSet:
         return self.combined().take(self.alive)
 
-    def _grow_alive(self, k):
-        self.alive = np.concatenate([self.alive, np.ones(k, bool)])
-
     def _live_indices(self, indices) -> np.ndarray:
         """``indices`` that name a live splat of this document; the rest dropped.
 
@@ -227,9 +225,8 @@ class Document:
             # second press): an empty step would be an undo that does
             # nothing, paid for with the whole redo stack.
             raise ValueError("the selection is empty")
-        self.alive[idx] = False
         e = Edit("delete", idx, 0, {"removed": int(len(idx))})
-        self._push(e)
+        self._commit_edit(e)
         return e
 
     @staticmethod
@@ -333,16 +330,13 @@ class Document:
             res.info["object"] = got.info
         removed, added = self._finish(live, res, params)
         removed = live_ids[removed]
-        self.alive[removed] = False
-        self.generated = self.generated.concat(added) if self.generated.n \
-            else added
-        self._grow_alive(added.n)
         e = Edit("repair", removed, added.n, res.info)
-        self._push(e)
         # kept for `refine_last`: the quick fill the deep fill would start from
         # (the picture fill is already what a refine would aim for)
-        self._refine = None if res.info.get("engine") == "image" else \
+        refine = None if res.info.get("engine") == "image" else \
             {"edit": e, "res": res, "local": local, "params": params}
+        self._commit_edit(e, added)
+        self._refine = refine
         return e
 
     # Two steps finish every new skin, whichever engine made it
@@ -495,12 +489,14 @@ class Document:
         r2 = view_fill(live_b, st["local"], st["params"], source=fill,
                        deep=deep_params or DeepParams(), base=res, on_progress=on_progress)
         same = (r2.added.n == res.added.n and len(r2.removed) == len(res.removed))
-        e.info.update({"refined": bool(r2.info.get("deep")) and same, "refineKept": None,
-                       "refine": {k: r2.info.get(k) for k in (
+        info = dict(e.info)
+        info.update({"refined": bool(r2.info.get("deep")) and same, "refineKept": None,
+                     "refine": {k: r2.info.get(k) for k in (
                            "deep", "fill_source", "fit", "offAxisGeo", "offAxisDeep",
                            "rejected", "grain_from_copy", "view_seconds",
                            "fromPicture", "pictureBound", "keptCopy")}})
-        if not e.info["refined"]:
+        if not info["refined"]:
+            e.info = info
             return e
         if judge:
             from .judge import judge as look
@@ -511,10 +507,11 @@ class Document:
                 import sys
                 print("judge:", repr(ex), file=sys.stderr)
                 v = {"keep": None, "why": "comparison failed: %s" % ex}
-            e.info["judge"] = v
-            e.info["refineKept"] = v.get("keep")
+            info["judge"] = v
+            info["refineKept"] = v.get("keep")
             if v.get("keep") is False:
-                e.info["refined"] = False
+                info["refined"] = False
+                e.info = info
                 self._refine = None
                 return e
         g0 = first - self.n_base
@@ -538,6 +535,7 @@ class Document:
             tail = tail.concat(back)
         self.generated = (self.generated.take(np.arange(g0)).concat(tail) if g0
                           else tail)
+        e.info = info
         self._refine = None
         self._floaters = None
         return e
@@ -574,13 +572,8 @@ class Document:
         local = pos_of[idx]
         res = run(self.live_splats(), local[local >= 0])
         removed = live_ids[res.removed]
-        self.alive[removed] = False
-        self.generated = (self.generated.concat(res.added)
-                          if self.generated.n else res.added)
-        self._grow_alive(res.added.n)
-        self._floaters = None
         e = Edit(kind, removed, res.added.n, res.info)
-        self._push(e)
+        self._commit_edit(e, res.added)
         return e
 
     def solidify(self, indices, view=None, params=None) -> Edit:
@@ -671,12 +664,8 @@ class Document:
             res.info["object"] = got.info
         removed, added = self._finish(live, res, params)
         removed = live_ids[removed]
-        self.alive[removed] = False
-        self.generated = self.generated.concat(added) if self.generated.n \
-            else added
-        self._grow_alive(added.n)
         e = Edit("repair", removed, added.n, res.info)
-        self._push(e)
+        self._commit_edit(e, added)
         return e
 
     def clone(self, source, target, radius, params=None, view=None) -> Edit:
@@ -756,14 +745,10 @@ class Document:
         removed, added = self._finish_skin(live, r.removed, r.added, view, spacing or info.get("spacing"), info,
                                            signed=True)
         removed = ids[removed]
-        self.alive[removed] = False
-        self.generated = self.generated.concat(added) if self.generated.n else added
-        self._grow_alive(added.n)
-        self._floaters = None
         if align is not None:
             info["align"] = align
         e = Edit("clone", removed, int(added.n), info)
-        self._push(e)
+        self._commit_edit(e, added)
         return e
 
     def clone_stroke(self, pairs, radius, params=None, view=None,
@@ -1060,10 +1045,6 @@ class Document:
             gone[more] = True
             gone &= ~hidden
             removed = base_ids[gone]
-        self.alive[removed] = False
-        self.generated = (self.generated.concat(kept)
-                          if self.generated.n else kept)
-        self._grow_alive(kept.n)
         info["mode"] = "clone"
         info["engine"] = "copy"
         if self._stamp_note:
@@ -1075,9 +1056,8 @@ class Document:
         # over the whole stroke, not whichever dab happened to come first
         info["rotation"] = round(float(np.max(rot_seen)), 2) if rot_seen else 0.0
         info["seamShift"] = round(float(np.median(shift_seen)), 3) if shift_seen else 0.0
-        self._floaters = None
         e = Edit("clone", removed, int(kept.n), info)
-        self._push(e)
+        self._commit_edit(e, kept)
         return e
 
     def transform(self, indices, rotation, translation, scale, pivot=None) -> Edit:
@@ -1101,32 +1081,68 @@ class Document:
         info = xf.apply(moving, np.arange(moving.n), rotation, translation,
                         scale, pivot)
 
-        self.alive[idx] = False
-        self.generated = self.generated.concat(moving) if self.generated.n else moving
-        self._grow_alive(moving.n)
-        self._floaters = None
         e = Edit("transform", idx, moving.n, dict(info))
-        self._push(e)
+        self._commit_edit(e, moving)
         return e
 
-    def _push(self, e: Edit):
+    def _commit_edit(self, e: Edit, added: Optional[SplatSet] = None):
+        """Prepare the mask and generated splats before publishing a new edit."""
+        generated = self.generated
+        if added is not None:
+            generated = generated.concat(added) if generated.n else added
+        alive = (np.concatenate([self.alive, np.ones(e.added, bool)])
+                 if e.added else self.alive.copy())
+        alive[e.removed] = False
+        redo = []
         self.undo_stack.append(e)
-        self.redo_stack.clear()
+        self.generated = generated
+        self.alive = alive
+        self.redo_stack = redo
         self._floaters = None
+
+    @contextmanager
+    def edit_transaction(self, command):
+        """Hold the previous state until an edit's reply has been written.
+
+        Edit operations replace the arrays. It is enough to retain their old
+        references and the history entries affected by this command.
+        """
+        state = self.generated, self.alive, self._floaters, self._refine
+        depth = len(self.undo_stack)
+        undo = self.undo_stack.copy() if command == "undo" else self.undo_stack
+        redo = self.redo_stack.copy() if command in ("undo", "redo") else self.redo_stack
+        active = self.redo_stack if command == "redo" else self.undo_stack
+        edit = active[-1] if active else None
+        if edit is not None:
+            info, tail = edit.info, edit.tail
+        try:
+            yield
+        except BaseException:
+            self.generated, self.alive, self._floaters, self._refine = state
+            self.undo_stack, self.redo_stack = undo, redo
+            while len(self.undo_stack) > depth:
+                self.undo_stack.pop()
+            if edit is not None:
+                edit.info, edit.tail = info, tail
+            raise
 
     def undo(self) -> Optional[Edit]:
         if not self.undo_stack:
             return None
-        e = self.undo_stack.pop()
-        self.alive[e.removed] = True
+        e = self.undo_stack[-1]
+        generated, tail = self.generated, e.tail
         if e.added:
             keep = self.generated.n - e.added
             # Keep the tail rather than drop it: this is what makes redo exact.
-            e.tail = self.generated.take(np.arange(keep, self.generated.n))
-            self.generated = self.generated.take(np.arange(keep))
-            self.alive = self.alive[: self.n_total]
-        self._floaters = None
+            tail = self.generated.take(np.arange(keep, self.generated.n))
+            generated = self.generated.take(np.arange(keep))
+        alive = self.alive[:self.n_base + generated.n].copy()
+        alive[e.removed] = True
         self.redo_stack.append(e)
+        self.undo_stack.pop()
+        e.tail = tail
+        self.generated, self.alive = generated, alive
+        self._floaters = None
         return e
 
     def redo(self) -> Optional[Edit]:
@@ -1137,19 +1153,21 @@ class Document:
         """
         if not self.redo_stack:
             return None
-        e = self.redo_stack.pop()
-        self.alive[e.removed] = False
+        e = self.redo_stack[-1]
+        generated = self.generated
         if e.added:
             if e.tail is None or e.tail.n != e.added:
                 # Should not happen; refuse rather than corrupt the document.
-                self.redo_stack.append(e)
                 return None
-            self.generated = (self.generated.concat(e.tail)
-                              if self.generated.n else e.tail)
-            self._grow_alive(e.added)
-            e.tail = None
-        self._floaters = None
+            generated = generated.concat(e.tail) if generated.n else e.tail
+        alive = (np.concatenate([self.alive, np.ones(e.added, bool)])
+                 if e.added else self.alive.copy())
+        alive[e.removed] = False
         self.undo_stack.append(e)
+        self.redo_stack.pop()
+        e.tail = None
+        self.generated, self.alive = generated, alive
+        self._floaters = None
         return e
 
     @property
