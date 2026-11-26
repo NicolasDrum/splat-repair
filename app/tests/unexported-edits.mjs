@@ -152,6 +152,11 @@ async function check(win) {
   await expectDirty(false, 'undo to the original file');
   assert.ok((await invoke('historyRedo')).ok);
   await expectDirty(true, 'redo away from the original file');
+
+  const reloaded = await invoke('open', saved);
+  assert.equal(reloaded.path, saved);
+  assert.equal(reloaded.alive, edited, 'the exported PLY must reopen with the saved geometry');
+  await expectDirty(false, 'opening the exported PLY');
 }
 
 let exitCode = 1;
