@@ -237,7 +237,7 @@ export class Viewer {
   navData: NavData | null = null;
   /** The active tool leaves the left button free ("Orbit"). */
   leftNavigates = false;
-  preset: NavPreset = 'blender';
+  preset: NavPreset = 'supersplat';
   /** Fly speed multiplier; the wheel changes it while flying. */
   flySpeed = 1;
   /** Short messages for the user (fly speed, view names). */
@@ -1057,7 +1057,7 @@ void modifySplatColor(vec3 center, inout vec4 color) { color.rgb = vec3(1.0, 0.0
         if (this.dragging === 'orbit') this.leaveAutoOrtho();
       }
       if (this.dragging === 'orbit') {
-        this.turn(dx, dy, this.drag.pivot);
+        this.turn(dx, this.preset === 'supersplat' ? -dy : dy, this.drag.pivot);
       } else if (this.dragging === 'look') {
         // fly: look around from where the camera is
         this.turn(dx, -dy, this.camera.getPosition().clone(), 0.18);
@@ -1131,6 +1131,11 @@ void modifySplatColor(vec3 center, inout vec4 color) { color.rgb = vec3(1.0, 0.0
   /** Set up what a gesture works around: the surface under the cursor. */
   private beginGesture(g: Gesture, x: number, y: number) {
     if (g === 'look') return;
+    if (g === 'orbit' && this.preset === 'supersplat') {
+      // Keep the focus chosen by framing, panning or a double-click.
+      this.drag.pivot = null;
+      return;
+    }
     const d = this.surfaceDepthAt(x, y);
     if (g === 'orbit') {
       if (d !== null) {

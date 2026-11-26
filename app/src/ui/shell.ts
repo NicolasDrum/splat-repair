@@ -86,7 +86,7 @@ function navRows(p: NavPreset): Array<[string, string]> {
   ];
   if (p === 'supersplat') {
     return [
-      ['Orbit around the point under the pointer', 'Drag left in Orbit · Alt+left'],
+      ['Orbit around the focus point', 'Drag left in Orbit · Alt+left'],
       ['Pan', 'Drag right · Shift+left in Orbit'],
       ['Zoom by dragging', 'Drag middle · Ctrl+left in Orbit'],
       ...common
