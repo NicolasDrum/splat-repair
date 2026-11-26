@@ -1,7 +1,9 @@
 """Round-trip and layout checks for the PLY reader/writer."""
 import os
+import struct
 import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -56,6 +58,77 @@ def test_channel_major_on_disk():
     rest = row[6:15]
     assert rest[0] == 1.0 and rest[3] == 2.0 and rest[8] == 3.0
     assert rest[[1, 2, 4, 5, 6, 7]].sum() == 0.0
+
+
+def test_end_header_in_comment():
+    s = _synthetic(n=4)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "comment.ply"
+        save_ply(p, s)
+        header, body = p.read_bytes().split(b"end_header\n", 1)
+        header = header.replace(b"element vertex", b"comment end_header is followed by data\nelement vertex")
+        for newline in (b"\n", b"\r\n"):
+            p.write_bytes((header + b"end_header\n").replace(b"\n", newline) + body)
+            np.testing.assert_array_equal(load_ply(p).xyz, s.xyz)
+
+
+def test_vertex_after_scalar_elements():
+    s = _synthetic(n=4)
+    s.extra["segment_id"] = np.array([3, 255, 42, 512], dtype="<u2")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "elements.ply"
+        save_ply(p, s)
+        header, body = p.read_bytes().split(b"end_header\n", 1)
+        header = header.replace(
+            b"element vertex",
+            b"element frame 2\nproperty uchar id\nproperty double time\n"
+            b"element camera 1\nproperty short exposure\nelement vertex",
+        )
+        header += b"element note 1\nproperty uint id\nend_header\n"
+        p.write_bytes(header + struct.pack("<BdBdh", 1, 42, 2, 43, -300)
+                      + body + struct.pack("<I", 987))
+        b = load_ply(p)
+    for name in ("xyz", "f_dc", "f_rest", "opacity", "scale", "rot"):
+        np.testing.assert_array_equal(getattr(b, name), getattr(s, name))
+    np.testing.assert_array_equal(b.extra["segment_id"], s.extra["segment_id"])
+    assert b.extra["segment_id"].dtype == s.extra["segment_id"].dtype
+
+
+def test_list_properties_before_or_within_vertex_are_refused():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "lists.ply"
+        save_ply(p, _synthetic(n=4))
+        header, body = p.read_bytes().split(b"end_header\n", 1)
+        prop = b"property list uchar int indices\n"
+        leading = header.replace(b"element vertex", b"element face 1\n" + prop + b"element vertex")
+        p.write_bytes(leading + b"end_header\n" + b"\x00" + body)
+        with np.testing.assert_raises_regex(ValueError, "list properties on the face element"):
+            load_ply(p)
+        p.write_bytes(header + prop + b"end_header\n" + body)
+        with np.testing.assert_raises_regex(ValueError, "list properties on the vertex element"):
+            load_ply(p)
+
+
+def test_truncated_ply_reports_the_missing_block():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "truncated.ply"
+        save_ply(p, _synthetic(n=4))
+        header, body = p.read_bytes().split(b"end_header\n", 1)
+        leading = header.replace(b"element vertex", b"element frame 1\nproperty float time\nelement vertex")
+        p.write_bytes(leading + b"end_header\n" + b"\x00")
+        with np.testing.assert_raises_regex(ValueError, "truncated before the vertex element"):
+            load_ply(p)
+        p.write_bytes(leading + b"end_header\n" + struct.pack("<f", 42) + body[:-1])
+        with np.testing.assert_raises_regex(ValueError, "truncated: header says 4"):
+            load_ply(p)
+
+
+def test_ply_header_size_is_bounded():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "long-header.ply"
+        p.write_bytes(b"ply\ncomment " + b"x" * (1 << 20) + b"\nend_header\n")
+        with np.testing.assert_raises_regex(ValueError, "header is implausibly large"):
+            load_ply(p)
 
 
 def test_copy_is_a_copy():

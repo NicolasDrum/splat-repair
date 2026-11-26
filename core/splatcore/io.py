@@ -146,42 +146,62 @@ class SplatSet:
         )
 
 
-def _parse_header(path):
-    with open(path, "rb") as f:
-        chunk = b""
-        while b"end_header" not in chunk:
-            more = f.read(8192)
-            if not more:
-                raise ValueError("not a PLY file: end_header is missing")
-            chunk += more
-            if len(chunk) > 1048576:
-                raise ValueError("PLY header is implausibly large")
-    end = chunk.index(b"end_header")
-    end = chunk.index(b"\n", end) + 1
-    lines = chunk[:end].decode("ascii", "replace").splitlines()
-    if not lines or lines[0].strip() != "ply":
-        raise ValueError("not a PLY file: wrong magic number")
-
-    fmt, count, props, in_vertex = None, None, [], False
-    for ln in lines[1:]:
-        parts = ln.split()
+def _parse_header(stream):
+    """Read the header and return the vertex layout and its offset into the body."""
+    remaining = 1 << 20
+    first = True
+    fmt = None
+    elements = []
+    while True:
+        line = stream.readline(remaining + 1)
+        if len(line) > remaining:
+            raise ValueError("PLY header is implausibly large")
+        if not line.endswith(b"\n"):
+            raise ValueError("not a PLY file: end_header is missing")
+        remaining -= len(line)
+        parts = line.decode("ascii", "replace").split()
+        if first:
+            if parts != ["ply"]:
+                raise ValueError("not a PLY file: wrong magic number")
+            first = False
+            continue
+        if parts == ["end_header"]:
+            break
         if not parts:
             continue
         if parts[0] == "format":
-            fmt = parts[1]
+            fmt = parts[1] if len(parts) > 1 else None
         elif parts[0] == "element":
-            in_vertex = parts[1] == "vertex"
-            if in_vertex:
-                count = int(parts[2])
-        elif parts[0] == "property" and in_vertex:
-            if parts[1] == "list":
-                raise ValueError("list properties on the vertex element are not supported")
-            props.append((parts[1], parts[2]))
+            if len(parts) != 3:
+                raise ValueError("invalid PLY element declaration")
+            elements.append((parts[1], parts[2], []))
+        elif parts[0] == "property" and elements:
+            elements[-1][2].append(parts[1:])
     if fmt != "binary_little_endian":
         raise ValueError("PLY format %r is not supported; expected binary_little_endian" % fmt)
-    if count is None:
-        raise ValueError("PLY without a vertex element")
-    return count, props, end
+    if sum(name == "vertex" for name, _, _ in elements) > 1:
+        raise ValueError("PLY has more than one vertex element")
+
+    # Binary records follow the order declared in the header. Only elements
+    # before vertex affect its offset, and empty elements occupy no bytes.
+    offset = 0
+    for name, count_text, fields in elements:
+        count = int(count_text)
+        if count < 0:
+            raise ValueError(f"negative count for PLY element {name!r}")
+        if name != "vertex" and count == 0:
+            continue
+        props = []
+        for field in fields:
+            if field and field[0] == "list":
+                raise ValueError(f"list properties on the {name} element are not supported")
+            if len(field) != 2 or field[0] not in _NP:
+                raise ValueError(f"invalid PLY property on element {name!r}: {' '.join(field)}")
+            props.append(tuple(field))
+        if name == "vertex":
+            return count, props, offset
+        offset += count * sum(np.dtype(_NP[ty]).itemsize for ty, _ in props)
+    raise ValueError("PLY without a vertex element")
 
 
 _NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
@@ -192,18 +212,25 @@ _NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
 
 def load_ply(path) -> SplatSet:
     """Load a 3DGS PLY into a SplatSet."""
-    count, props, offset = _parse_header(path)
-    dtype = np.dtype([(name, _NP[ty]) for ty, name in props])
-    raw = np.fromfile(path, dtype=dtype, count=count, offset=offset)
-    if len(raw) != count:
-        raise ValueError("PLY truncated: header says %d, read %d" % (count, len(raw)))
-
-    names = {name for _, name in props}
     need = {"x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2",
             "rot_0", "rot_1", "rot_2", "rot_3"}
-    missing = need - names
-    if missing:
-        raise ValueError("the PLY lacks required properties: %s" % sorted(missing))
+    with open(path, "rb") as stream:
+        count, props, offset = _parse_header(stream)
+        names = {name for _, name in props}
+        missing = need - names
+        if missing:
+            raise ValueError("the PLY lacks required properties: %s" % sorted(missing))
+        dtype = np.dtype([(name, _NP[ty]) for ty, name in props])
+        body_bytes = os.fstat(stream.fileno()).st_size - stream.tell()
+        if offset > body_bytes:
+            raise ValueError("PLY truncated before the vertex element")
+        available = (body_bytes - offset) // dtype.itemsize
+        if available < count:
+            raise ValueError("PLY truncated: header says %d, file holds %d vertex records"
+                             % (count, available))
+        raw = np.fromfile(stream, dtype=dtype, count=count, offset=offset)
+    if len(raw) != count:
+        raise ValueError("PLY truncated: header says %d, read %d" % (count, len(raw)))
 
     def col(*keys):
         return np.stack([raw[k].astype(np.float32) for k in keys], axis=-1)
