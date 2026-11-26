@@ -155,6 +155,7 @@ let stroke: StrokeSample[] = [];
 let painting = false;
 let depthMode: 'quick' | 'deep' = 'quick';
 let gpuSel: GpuSelector | null = null;
+let gpuSelGenerated: GpuSelector | null = null;
 let lastCaps: CapsulePoint[] = [];
 let caps: Record<string, any> = { deep: false };
 /**
@@ -426,6 +427,7 @@ async function engine(cmd: string, args: Record<string, any> = {}, payload?: Arr
  * and every edit went to a document the user was not looking at.
  */
 function closeDocument() {
+  destroyGpuSelectors();
   viewer.clear();
   // an empty document: the same arrays a load builds, with no splats in them
   doc.load({ numSplats: 0, elements: [{ name: 'vertex', properties: [] }] });
@@ -434,8 +436,6 @@ function closeDocument() {
   lastFill = null;
   lastFillVolume = null;
   exportedRevision = 0;
-  gpuSel?.destroy();
-  gpuSel = null;
   cloneSource = cloneOrigin = cloneAlignedOffset = null;
   cloneView = null;
   cloneOffset = cloneScreenOff = cloneCarry = null;
@@ -509,8 +509,7 @@ async function openFile(path: string) {
       viewName += '.ply';
     }
     // the old file's textures go with it; the GPU brush must not keep them
-    gpuSel?.destroy();
-    gpuSel = null;
+    destroyGpuSelectors();
     const info = await viewer.load(window.host.splatUrl(viewPath), viewName);
     doc.load(viewer.gsplatData);
     filePath = path;
@@ -532,15 +531,6 @@ async function openFile(path: string) {
     // Upright before the first frame is shown: the axis this file was last
     // viewed with, else the 3DGS convention.
     applyUpAxis(savedUpAxis(path), false);
-    if (viewer.splat && viewer.editState) {
-      // What the GPU brush needs to see a splat's size. Written once: the
-      // loaded file never changes on the GPU, only its flags do.
-      viewer.writeStream(viewer.splat, 'editCovA',
-        new Uint32Array(doc.covA.buffer, doc.covA.byteOffset, doc.nBase * 4));
-      viewer.writeStream(viewer.splat, 'editCovB',
-        new Uint32Array(doc.covB.buffer, doc.covB.byteOffset, doc.nBase * 2));
-    }
-
     $('file-name').textContent = path;
     hint.hidden = true;
     $<HTMLButtonElement>('btn-export').disabled = false;
@@ -554,11 +544,7 @@ async function openFile(path: string) {
     projDirty = true;
     lastGeneratedCount = 0;
     gpuSel = viewer.splat && viewer.editState
-      ? new GpuSelector(viewer.device, viewer.splat) : null;
-    if (gpuSel && !gpuSel.ready) {
-      console.warn('GPU selection unavailable:', gpuSel.reason);
-      gpuSel = null;
-    }
+      ? initGpuSelector(viewer.splat, 0, doc.nBase) : null;
     clearSelection();
     history.reset(`Opened: ${path.split(/[\\/]/).pop() ?? path}`);
     shell?.opened(path);
@@ -729,12 +715,13 @@ function previewSelection() {
     (x, y, d) => viewer.unproject(x, y, d),
     (d) => viewer.worldPerPixelAt(d));
   // un-painting reaches deeper than painting (strokeSquash)
-  const squash = strokeSquash(depth, selectMode, strokeStartVolume, viewer.viewDirection(), lastCaps);
-  if (gpuSel?.ready
-      && gpuSel.run(lastCaps, viewer.viewDirection(), squash, selectMode, sizeReach)) {
+  const view = viewer.viewDirection();
+  const squash = strokeSquash(depth, selectMode, strokeStartVolume, view, lastCaps);
+  if (gpuSel?.ready && (!viewer.generated || gpuSelGenerated?.ready)
+      && gpuSel.run(lastCaps, view, squash, selectMode, sizeReach)
+      && (!gpuSelGenerated || gpuSelGenerated.run(lastCaps, view, squash, selectMode, sizeReach))) {
     // the outline follows the stroke; built when volumeview.ts gets to it
     const caps = lastCaps, mode = selectMode, base = strokeStartVolume;
-    const view = viewer.viewDirection();
     volumeOutline?.preview(() => caps.length
       ? withOp(base, { kind: 'brush', add: true, view, rows: segmentRows(caps, squash) }, mode, false)
       : mode === 'replace' ? EMPTY_VOLUME : base);
@@ -1676,6 +1663,27 @@ async function doExport() {
   }
 }
 
+function destroyGpuSelectors() {
+  gpuSel?.destroy();
+  gpuSelGenerated?.destroy();
+  gpuSel = gpuSelGenerated = null;
+}
+
+function initGpuSelector(entity: NonNullable<Viewer['splat']>, offset: number, count: number) {
+  // A component's texture is indexed locally. The generated component starts
+  // at doc.nBase in the document's covariance arrays.
+  const byteOffset = offset * Uint32Array.BYTES_PER_ELEMENT;
+  const a = new Uint32Array(doc.covA.buffer, doc.covA.byteOffset + byteOffset * 4, count * 4);
+  const b = new Uint32Array(doc.covB.buffer, doc.covB.byteOffset + byteOffset * 2, count * 2);
+  if (!viewer.writeStream(entity, 'editCovA', a) || !viewer.writeStream(entity, 'editCovB', b)) return null;
+
+  const selector = new GpuSelector(viewer.device, entity);
+  if (selector.ready) return selector;
+  console.warn('GPU selection unavailable:', selector.reason);
+  selector.destroy();
+  return null;
+}
+
 /** Push the current deleted/selected flags to the GPU. Microseconds, no upload. */
 function applyStates() {
   if (!viewer.splat) return;
@@ -1684,7 +1692,7 @@ function applyStates() {
   // The crop preview is folded into the deleted flags here, so it survives
   // the next selection change -- it used to vanish the moment anything was
   // selected, while the crop button stayed armed.
-  if (painting && gpuSel?.ready && tool === 'brush') {
+  if (painting && tool === 'brush' && gpuSel?.ready && (!viewer.generated || gpuSelGenerated?.ready)) {
     viewer.writeStream(viewer.splat, 'editDel', cropHidden(doc.baseDeleted(), 0));
     if (viewer.generated) {
       viewer.writeStream(viewer.generated, 'editDel', cropHidden(doc.genDeleted(), doc.nBase));
@@ -1710,7 +1718,12 @@ function applyStates() {
 function rebuild() {
   const t0 = performance.now();
   if (doc.nGenerated !== lastGeneratedCount) {
+    gpuSelGenerated?.destroy();
+    gpuSelGenerated = null;
     viewer.setGenerated(doc.buildGenerated());
+    if (viewer.generated && viewer.generatedEditState && gpuSel?.ready) {
+      gpuSelGenerated = initGpuSelector(viewer.generated, doc.nBase, doc.nGenerated);
+    }
     lastGeneratedCount = doc.nGenerated;
   }
   // The crop preview follows the document: an undo brings back splats it
@@ -3482,7 +3495,8 @@ window.host.engine.onEvent((e) => {
              mode, reach, surface: lastRegion };
   },
   /** Build the stroke and show only the GPU's answer. */
-  selectGpu(points: [number, number, number][], radius: number, depth = 1.5) {
+  selectGpu(points: [number, number, number][], radius: number, depth = 1.5,
+            mode?: SelectMode, failGeneratedPass = false) {
     const r = canvas.getBoundingClientRect();
     $<HTMLInputElement>('brush-depth').value = String(depth);
     setTool('brush');
@@ -3494,16 +3508,54 @@ window.host.engine.onEvent((e) => {
     // Wipe the stream first. Otherwise a GPU pass that quietly did nothing
     // leaves the previous CPU answer sitting there and the comparison passes
     // without having tested anything.
-    selMask = new Uint8Array(doc.nTotal); selCount = 0; selDirty = true;
-    if (viewer.splat) viewer.writeStream(viewer.splat, 'editSel', new Uint32Array(doc.nBase));
-    if (viewer.generated) {
-      viewer.writeStream(viewer.generated, 'editSel', new Uint32Array(doc.nGenerated));
+    if (mode === undefined) {
+      selMask = new Uint8Array(doc.nTotal); selCount = 0; selDirty = true;
+    } else {
+      selectMode = mode;
+      strokeStartVolume = selVolume;
     }
+    applyStates();
     const t0 = performance.now();
-    previewSelection();
-    return { ok: !!gpuSel?.ready, ms: +(performance.now() - t0).toFixed(2),
+    if (!failGeneratedPass) {
+      previewSelection();
+    } else {
+      const selector = gpuSelGenerated;
+      if (!gpuSel?.ready || !selector?.ready) throw new Error('Both selectors must be ready');
+      const originalRun = selector.run;
+      selector.run = () => { selector.ready = false; return false; };
+      painting = true;
+      strokeStart = selMask.slice();
+      try {
+        previewSelection();
+      } finally {
+        selector.run = originalRun;
+        painting = false;
+        strokeStart = null;
+      }
+    }
+    return { ok: !!gpuSel?.ready && (!viewer.generated || !!gpuSelGenerated?.ready),
+             ms: +(performance.now() - t0).toFixed(2),
              capsules: lastCaps.length, viewport: [r.width | 0, r.height | 0],
-             reason: gpuSel?.reason || undefined };
+             reason: gpuSel?.reason || gpuSelGenerated?.reason || undefined };
+  },
+  /** Read the WebGPU preview before the exact CPU selection overwrites it. */
+  async gpuBrushMask() {
+    let count = 0, hash = 2166136261 >>> 0;
+    const read = async (entity: Viewer['splat'], offset: number, length: number) => {
+      if (!entity) return;
+      const texture = (entity.gsplat as any)?.getInstanceTexture?.('editSel');
+      const values = await texture?.read(0, 0, texture.width, texture.height, { immediate: true });
+      if (!values) throw new Error('GPU selection readback is unavailable');
+      for (let i = 0; i < length; i++) {
+        if (!values[i]) continue;
+        count++;
+        hash = Math.imul(hash ^ (offset + i), 16777619) >>> 0;
+      }
+    };
+    await read(viewer.splat, 0, doc.nBase);
+    const base = count;
+    await read(viewer.generated, doc.nBase, doc.nGenerated);
+    return { count, hash, base, generated: count - base };
   },
   /** Same stroke, exact CPU answer, written into the same stream. */
   selectCpu() {
